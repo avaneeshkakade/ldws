@@ -31,6 +31,8 @@ const char* password = "coep@123";
 #define CAM_WIDTH         320 // QVGA
 #define CAM_HEIGHT        240
 #define ROI_START_Y       (CAM_HEIGHT / 2)
+#define ALERT_GPIO_NUM  4
+#define ALERT_PIN_MASK  (1UL << ALERT_GPIO_NUM)
 static const char* TAG   = "ldws_main";
 
 struct Point2D { int x, y; };
@@ -70,12 +72,26 @@ bool initCamera() {
     config.jpeg_quality = 12;
     config.fb_count = 2; // Double buffered DMA
 
+
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
         return false;
     }
     return true;
+}
+
+void initAlertGPIO() {
+    GPIO.enable_w1ts = ALERT_PIN_MASK;
+    GPIO.out_w1tc = ALERT_PIN_MASK;
+}
+
+static inline void alert_on() {
+    GPIO.out_w1ts = ALERT_PIN_MASK;
+}
+
+static inline void alert_off() {
+    GPIO.out_w1tc = ALERT_PIN_MASK;
 }
 
 std::vector<Point2D> detectEdges(camera_fb_t *fb) {
@@ -169,6 +185,22 @@ void run_ldws_pipeline(camera_fb_t *fb) {
     // Render detected lanes onto the frame
     drawLine(fb->buf, leftLane, CAM_WIDTH, CAM_HEIGHT);
     drawLine(fb->buf, rightLane, CAM_WIDTH, CAM_HEIGHT);
+
+    int bottom_y = CAM_HEIGHT - 1;
+    int left_x  = (int)(((double)bottom_y - leftLane.c)  / leftLane.m);
+    int right_x = (int)(((double)bottom_y - rightLane.c) / rightLane.m);
+
+    int lane_center = (left_x + right_x) / 2;
+    int vehicle_center = CAM_WIDTH / 2; // Fixed camera mounting axis
+
+    int departure_error = vehicle_center - lane_center;
+    int DEPARTURE_THRESHOLD_PX = 30; // 30 pixels drift = alert threshold
+
+    if (std::abs(departure_error) > DEPARTURE_THRESHOLD_PX) {
+        alert_on();   // Atomic write: GPIO.out_w1ts = (1UL << 4);
+    } else {
+        alert_off();  // Atomic write: GPIO.out_w1tc = (1UL << 4);
+    }
 
     // Optional: Update debug frame for HTTP stream without stalling processing
     uint8_t* temp_jpg = NULL;

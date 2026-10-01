@@ -1,11 +1,3 @@
-//
-// Created by Avaneesh on 25-07-2026.
-//
-
-//
-// Created by Avaneesh on 25-07-2026.
-//
-
 #include "esp_camera.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
@@ -16,7 +8,7 @@
 #include <cstdlib>
 #include <Arduino.h>
 
-const char* ssid = "Netgear_Test";
+const char* ssid     = "Netgear_Test";
 const char* password = "coep@123";
 
 #define PWDN_GPIO_NUM     32
@@ -36,13 +28,21 @@ const char* password = "coep@123";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-#define CAM_WIDTH  320 // QVGA
-#define CAM_HEIGHT 240
-#define ROI_START_Y (CAM_HEIGHT / 2)
-static const char* TAG = "cam_main";
+#define CAM_WIDTH         320 // QVGA
+#define CAM_HEIGHT        240
+#define ROI_START_Y       (CAM_HEIGHT / 2)
+static const char* TAG   = "ldws_main";
 
 struct Point2D { int x, y; };
 struct LineModel { double m; double c; };
+
+// Synchronization primitives
+QueueHandle_t xFrameQueue = NULL;
+SemaphoreHandle_t xDebugJpgMutex = NULL;
+
+// Shared JPEG buffer for optional HTTP debugging
+uint8_t* latest_jpg_buf = NULL;
+size_t latest_jpg_len = 0;
 
 bool initCamera() {
     camera_config_t config;
@@ -68,11 +68,11 @@ bool initCamera() {
     config.pixel_format = PIXFORMAT_GRAYSCALE;
     config.frame_size = FRAMESIZE_QVGA;
     config.jpeg_quality = 12;
-    config.fb_count = 2;
+    config.fb_count = 2; // Double buffered DMA
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
+        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
         return false;
     }
     return true;
@@ -118,15 +118,17 @@ LineModel runRANSAC(const std::vector<Point2D>& points) {
         Point2D p2 = points[idx2];
 
         double m, c;
-        if (p2.x == p1.x) { m = 1000; c = p1.x; }
-        else {
-            m = (double)(p2.y - p1.y) / (p2.x - p1.x);
-            c = p1.y - m * p1.x;
+        if (p2.x == p1.x) { 
+            m = 1000.0; 
+            c = p1.x; 
+        } else {
+            m = (double)(p2.y - p1.y) / (double)(p2.x - p1.x);
+            c = (double)p1.y - m * (double)p1.x;
         }
 
         int currentInliers = 0;
         for (const auto& p : points) {
-            double d = std::abs(p.y - m * p.x - c) / std::sqrt(m * m + 1);
+            double d = std::abs((double)p.y - m * (double)p.x - c) / std::sqrt(m * m + 1.0);
             if (d < distThresh) currentInliers++;
         }
 
@@ -138,17 +140,74 @@ LineModel runRANSAC(const std::vector<Point2D>& points) {
     return bestLine;
 }
 
-
 void drawLine(uint8_t* buf, LineModel line, int width, int height) {
     if (std::abs(line.m) < 0.01) return;
 
     for (int y = ROI_START_Y; y < height; y++) {
-        int x = (int)((y - line.c) / line.m);
-
+        int x = (int)(((double)y - line.c) / line.m);
         if (x >= 0 && x < width) {
             buf[y * width + x] = 255;
-            if(x > 0) buf[y * width + (x-1)] = 255;
-            if(x < width-1) buf[y * width + (x+1)] = 255;
+            if (x > 0) buf[y * width + (x - 1)] = 255;
+            if (x < width - 1) buf[y * width + (x + 1)] = 255;
+        }
+    }
+}
+
+void run_ldws_pipeline(camera_fb_t *fb) {
+    std::vector<Point2D> allEdges = detectEdges(fb);
+
+    std::vector<Point2D> leftPoints;
+    std::vector<Point2D> rightPoints;
+    for (const auto& p : allEdges) {
+        if (p.x < CAM_WIDTH / 2) leftPoints.push_back(p);
+        else rightPoints.push_back(p);
+    }
+
+    LineModel leftLane = runRANSAC(leftPoints);
+    LineModel rightLane = runRANSAC(rightPoints);
+
+    // Render detected lanes onto the frame
+    drawLine(fb->buf, leftLane, CAM_WIDTH, CAM_HEIGHT);
+    drawLine(fb->buf, rightLane, CAM_WIDTH, CAM_HEIGHT);
+
+    // Optional: Update debug frame for HTTP stream without stalling processing
+    uint8_t* temp_jpg = NULL;
+    size_t temp_len = 0;
+    if (frame2jpg(fb, 80, &temp_jpg, &temp_len)) {
+        if (xSemaphoreTake(xDebugJpgMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            if (latest_jpg_buf) free(latest_jpg_buf);
+            latest_jpg_buf = temp_jpg;
+            latest_jpg_len = temp_len;
+            xSemaphoreGive(xDebugJpgMutex);
+        } else {
+            free(temp_jpg);
+        }
+    }
+}
+
+// PRODUCER: Core 0 (I/O, High Priority)
+void captureTask(void *pvParameters) {
+    while (1) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        // Timeout = 0: Discard stale frame immediately if consumer is occupied
+        if (xQueueSend(xFrameQueue, &fb, 0) != pdTRUE) {
+            esp_camera_fb_return(fb);
+        }
+    }
+}
+
+// CONSUMER: Core 1 (Compute, Normal Priority)
+void processTask(void *pvParameters) {
+    camera_fb_t *fb = NULL;
+    while (1) {
+        if (xQueueReceive(xFrameQueue, &fb, portMAX_DELAY) == pdTRUE) {
+            run_ldws_pipeline(fb);
+            esp_camera_fb_return(fb); // Hand back ownership to camera driver
         }
     }
 }
@@ -159,61 +218,34 @@ static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 esp_err_t stream_handler(httpd_req_t *req) {
-    camera_fb_t * fb = NULL;
-    esp_err_t res = ESP_OK;
-    size_t _jpg_buf_len = 0;
-    uint8_t * _jpg_buf = NULL;
-    char * part_buf[64];
-
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    esp_err_t res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) return res;
 
+    char part_buf[64];
     while (true) {
-        fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGE(TAG, "Camera capture failed");
-            res = ESP_FAIL;
-            break;
-        }
+        uint8_t* local_buf = NULL;
+        size_t local_len = 0;
 
-        std::vector<Point2D> allEdges = detectEdges(fb);
-
-        std::vector<Point2D> leftPoints;
-        std::vector<Point2D> rightPoints;
-        for (auto p : allEdges) {
-            if (p.x < CAM_WIDTH / 2) leftPoints.push_back(p);
-            else rightPoints.push_back(p);
-        }
-
-        LineModel leftLane = runRANSAC(leftPoints);
-        LineModel rightLane = runRANSAC(rightPoints);
-
-        drawLine(fb->buf, leftLane, CAM_WIDTH, CAM_HEIGHT);
-        drawLine(fb->buf, rightLane, CAM_WIDTH, CAM_HEIGHT);
-
-        bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-        esp_camera_fb_return(fb);
-        fb = NULL;
-
-        if (!jpeg_converted) {
-            ESP_LOGE(TAG, "JPEG compression failed");
-            res = ESP_FAIL;
-        } else {
-            if (res == ESP_OK) {
-                size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
-                res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-                if (res == ESP_OK) {
-                    res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-                }
-                if (res == ESP_OK) {
-                    res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        // Fetch the most recent processed JPEG from the debug cache
+        if (xSemaphoreTake(xDebugJpgMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (latest_jpg_buf && latest_jpg_len > 0) {
+                local_buf = (uint8_t*)malloc(latest_jpg_len);
+                if (local_buf) {
+                    memcpy(local_buf, latest_jpg_buf, latest_jpg_len);
+                    local_len = latest_jpg_len;
                 }
             }
+            xSemaphoreGive(xDebugJpgMutex);
         }
 
-        if (_jpg_buf) {
-            free(_jpg_buf);
-            _jpg_buf = NULL;
+        if (local_buf && local_len > 0) {
+            size_t hlen = snprintf(part_buf, 64, _STREAM_PART, local_len);
+            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+            if (res == ESP_OK) res = httpd_resp_send_chunk(req, part_buf, hlen);
+            if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)local_buf, local_len);
+            free(local_buf);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(30)); // Avoid tight looping if no frame is ready
         }
 
         if (res != ESP_OK) break;
@@ -247,21 +279,45 @@ void setup() {
         delay(500);
         Serial.print(".");
     }
-    Serial.println("");
-    Serial.print("WiFi connected: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("\nWiFi connected");
 
     if (!initCamera()) {
         Serial.println("Camera Init Failed");
-        while(1);
+        while (1);
     }
 
+    // Allocate RTOS synchronization primitives
+    xFrameQueue = xQueueCreate(1, sizeof(camera_fb_t*));
+    xDebugJpgMutex = xSemaphoreCreateMutex();
+
+    // Core 0: High-priority hardware capture
+    xTaskCreatePinnedToCore(
+        captureTask,
+        "CaptureTask",
+        4096,
+        NULL,
+        2,
+        NULL,
+        0
+    );
+
+    // Core 1: Compute-heavy algorithm processing
+    xTaskCreatePinnedToCore(
+        processTask,
+        "ProcessTask",
+        8192,
+        NULL,
+        1,
+        NULL,
+        1
+    );
+
     startCameraServer();
-    Serial.print("Stream ready at: http://");
-    Serial.print(WiFi.localIP());
-    Serial.println("/stream");
+    Serial.print("Stream ready: http://");
+    Serial.println(WiFi.localIP());
 }
 
 void loop() {
-    delay(1000);
+    // Arduino loop remains completely idle; FreeRTOS scheduler drives execution
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
